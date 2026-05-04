@@ -27,7 +27,7 @@ docker compose up --build
 
 El servicio queda disponible en `http://localhost:8080`.
 
-### Opción 2 — Python local contra Supabase
+### Opción 2 — Docker Compose contra Supabase
 
 1. Crear un proyecto en [supabase.com](https://supabase.com).
 2. Ejecutar `schema.sql` en el SQL Editor del proyecto.
@@ -38,7 +38,17 @@ SUPABASE_URL=https://your-project-id.supabase.co
 SUPABASE_KEY=your-anon-or-service-role-key
 ```
 
-4. Cargar datos iniciales y arrancar:
+4. Cargar datos iniciales y levantar el contenedor:
+
+```bash
+pip install -r requirements.txt
+python seed.py
+docker compose -f docker-compose.supabase.yml up --build
+```
+
+### Opción 3 — Python local contra Supabase
+
+Mismos pasos que la opción 2 pero sin Docker:
 
 ```bash
 pip install -r requirements.txt
@@ -46,7 +56,7 @@ python seed.py
 python app.py
 ```
 
-### Opción 3 — Python local contra PostgreSQL local
+### Opción 4 — Python local contra PostgreSQL local
 
 ```bash
 pip install -r requirements.txt
