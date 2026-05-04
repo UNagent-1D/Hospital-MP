@@ -1,6 +1,32 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: hospital
+      POSTGRES_USER: hospital
+      POSTGRES_PASSWORD: hospital
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      - ./seed.sql:/docker-entrypoint-initdb.d/02_seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hospital"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   hospital-mock-api:
     build: .
     ports:
       - "8080:8080"
     restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://hospital:hospital@postgres:5432/hospital
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

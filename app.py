@@ -1,83 +1,12 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request
+from dotenv import load_dotenv
+from db import get_db
+
+load_dotenv()
 
 app = Flask(__name__)
-
-# ---------------------------------------------------------------------------
-# Seed data
-# ---------------------------------------------------------------------------
-
-DOCTORS = {
-    "doc-001": {
-        "id": "doc-001",
-        "name": "Dr. Alejandra Rios",
-        "area": "Cardiologist",
-        "phone": "+573101234567",
-        "place": "Bogota Norte — Clínica San Ignacio, Room 4A",
-    },
-    "doc-002": {
-        "id": "doc-002",
-        "name": "Dr. Carlos Mendoza",
-        "area": "Pediatrician",
-        "phone": "+573107654321",
-        "place": "Bogota Sur — Torre Médica Central, Floor 2",
-    },
-    "doc-003": {
-        "id": "doc-003",
-        "name": "Dr. Laura Estrada",
-        "area": "General Practitioner",
-        "phone": "+573109876543",
-        "place": "Medellin Centro — Centro Médico Poblado, Room 101",
-    },
-    "doc-004": {
-        "id": "doc-004",
-        "name": "Dr. Marcos Villegas",
-        "area": "Neurologist",
-        "phone": "+573102345678",
-        "place": "Bogota Norte — Clínica San Ignacio, Neurology Wing, Room 7",
-    },
-    "doc-005": {
-        "id": "doc-005",
-        "name": "Dr. Sofia Herrera",
-        "area": "Pediatrician",
-        "phone": "+573108765432",
-        "place": "Bogota Sur — Hospital El Tunal, Pediatrics Block B",
-    },
-}
-
-now_iso = datetime.now(timezone.utc).isoformat()
-
-APPOINTMENTS = {
-    "appt-seed-001": {
-        "id": "appt-seed-001",
-        "doctor_id": "doc-001",
-        "doctor_name": "Dr. Alejandra Rios",
-        "patient_ref": "HOSP-PAT-00492",
-        "patient_name": "Maria Gomez Torres",
-        "specialty": "Cardiologist",
-        "slot_start": "2026-03-15T09:00:00",
-        "slot_end": "2026-03-15T09:30:00",
-        "status": "confirmed",
-        "created_at": now_iso,
-        "cancelled_at": None,
-        "cancel_reason": None,
-    },
-    "appt-seed-002": {
-        "id": "appt-seed-002",
-        "doctor_id": "doc-003",
-        "doctor_name": "Dr. Laura Estrada",
-        "patient_ref": "HOSP-PAT-00492",
-        "patient_name": "Maria Gomez Torres",
-        "specialty": "General Practitioner",
-        "slot_start": "2026-03-20T11:00:00",
-        "slot_end": "2026-03-20T11:30:00",
-        "status": "confirmed",
-        "created_at": now_iso,
-        "cancelled_at": None,
-        "cancel_reason": None,
-    },
-}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -87,14 +16,8 @@ SLOT_HOURS = [9, 10, 11, 14, 15, 16]
 MAX_DAYS_AHEAD = 30
 
 
-def _generate_slots(doctor_id: str, days_ahead: int) -> list[dict]:
-    """Return available 30-min slots for *doctor_id* over the next *days_ahead* weekdays."""
-    booked = {
-        appt["slot_start"]
-        for appt in APPOINTMENTS.values()
-        if appt["doctor_id"] == doctor_id and appt["status"] == "confirmed"
-    }
-
+def _generate_slots(booked: set, days_ahead: int) -> list:
+    """Return available 30-min slots given a set of already-booked slot_start strings."""
     slots = []
     today = datetime.now().date()
     checked = 0
@@ -139,24 +62,25 @@ def health():
 # 4.1 GET /doctors
 @app.get("/doctors")
 def list_doctors():
-    area_filter = request.args.get("area", "").strip().lower()
-    place_filter = request.args.get("place", "").strip().lower()
+    area_filter = request.args.get("area", "").strip()
+    place_filter = request.args.get("place", "").strip()
 
-    result = []
-    for doc in DOCTORS.values():
-        if area_filter and area_filter not in doc["area"].lower():
-            continue
-        if place_filter and place_filter not in doc["place"].lower():
-            continue
-        result.append(doc)
+    query = get_db().table("doctors").select("*")
+    if area_filter:
+        query = query.ilike("area", f"%{area_filter}%")
+    if place_filter:
+        query = query.ilike("place", f"%{place_filter}%")
 
-    return jsonify({"data": result})
+    result = query.execute()
+    return jsonify({"data": result.data})
 
 
 # 4.2 GET /doctors/<doctor_id>/schedule
 @app.get("/doctors/<doctor_id>/schedule")
 def get_doctor_schedule(doctor_id: str):
-    if doctor_id not in DOCTORS:
+    db = get_db()
+    doc_res = db.table("doctors").select("*").eq("id", doctor_id).execute()
+    if not doc_res.data:
         return jsonify({"error": "doctor not found"}), 404
 
     days_ahead_raw = request.args.get("days_ahead", "7")
@@ -166,7 +90,16 @@ def get_doctor_schedule(doctor_id: str):
         return jsonify({"error": "days_ahead must be an integer"}), 400
 
     days_ahead = min(max(days_ahead, 1), MAX_DAYS_AHEAD)
-    doc = DOCTORS[doctor_id]
+    doc = doc_res.data[0]
+
+    booked_res = (
+        db.table("appointments")
+        .select("slot_start")
+        .eq("doctor_id", doctor_id)
+        .eq("status", "confirmed")
+        .execute()
+    )
+    booked = {row["slot_start"] for row in booked_res.data}
 
     return jsonify(
         {
@@ -174,7 +107,7 @@ def get_doctor_schedule(doctor_id: str):
             "doctor_name": doc["name"],
             "area": doc["area"],
             "place": doc["place"],
-            "slots": _generate_slots(doctor_id, days_ahead),
+            "slots": _generate_slots(booked, days_ahead),
         }
     )
 
@@ -198,24 +131,26 @@ def book_appointment():
     except ValueError:
         return jsonify({"error": "slot_start must be ISO 8601 format e.g. 2026-03-15T09:00:00"}), 400
 
-    if doctor_id not in DOCTORS:
+    db = get_db()
+    doc_res = db.table("doctors").select("*").eq("id", doctor_id).execute()
+    if not doc_res.data:
         return jsonify({"error": "doctor not found"}), 404
 
     slot_start_iso = slot_start_dt.strftime("%Y-%m-%dT%H:%M:%S")
     slot_end_iso = (slot_start_dt + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
 
-    for appt in APPOINTMENTS.values():
-        if (
-            appt["doctor_id"] == doctor_id
-            and appt["slot_start"] == slot_start_iso
-            and appt["status"] == "confirmed"
-        ):
-            return (
-                jsonify({"error": f"slot {slot_start_iso} is already booked for doctor {doctor_id}"}),
-                409,
-            )
+    conflict = (
+        db.table("appointments")
+        .select("id")
+        .eq("doctor_id", doctor_id)
+        .eq("slot_start", slot_start_iso)
+        .eq("status", "confirmed")
+        .execute()
+    )
+    if conflict.data:
+        return jsonify({"error": f"slot {slot_start_iso} is already booked for doctor {doctor_id}"}), 409
 
-    doc = DOCTORS[doctor_id]
+    doc = doc_res.data[0]
     appt_id = f"appt-{uuid.uuid4().hex[:8]}"
     now = datetime.now(timezone.utc).isoformat()
 
@@ -234,17 +169,19 @@ def book_appointment():
         "cancel_reason": None,
     }
 
-    APPOINTMENTS[appt_id] = appt
+    db.table("appointments").insert(appt).execute()
     return jsonify(_appointment_out(appt)), 201
 
 
 # 4.4 POST /appointments/<appt_id>/cancel
 @app.post("/appointments/<appt_id>/cancel")
 def cancel_appointment(appt_id: str):
-    appt = APPOINTMENTS.get(appt_id)
-    if appt is None:
+    db = get_db()
+    appt_res = db.table("appointments").select("*").eq("id", appt_id).execute()
+    if not appt_res.data:
         return jsonify({"error": "appointment not found"}), 404
 
+    appt = appt_res.data[0]
     if appt["status"] == "cancelled":
         return jsonify({"error": "appointment is already cancelled"}), 409
 
@@ -252,18 +189,11 @@ def cancel_appointment(appt_id: str):
     reason = body.get("reason") or "not specified"
     now = datetime.now(timezone.utc).isoformat()
 
-    appt["status"] = "cancelled"
-    appt["cancelled_at"] = now
-    appt["cancel_reason"] = reason
+    db.table("appointments").update(
+        {"status": "cancelled", "cancelled_at": now, "cancel_reason": reason}
+    ).eq("id", appt_id).execute()
 
-    return jsonify(
-        {
-            "id": appt_id,
-            "status": "cancelled",
-            "cancelled_at": now,
-            "reason": reason,
-        }
-    )
+    return jsonify({"id": appt_id, "status": "cancelled", "cancelled_at": now, "reason": reason})
 
 
 # 4.5 GET /patients/<patient_ref>/appointments
@@ -275,16 +205,15 @@ def get_patient_appointments(patient_ref: str):
     if status_filter not in valid_statuses:
         return jsonify({"error": "status must be one of: confirmed, cancelled, all"}), 400
 
-    result = [
-        _appointment_out(appt)
-        for appt in APPOINTMENTS.values()
-        if appt["patient_ref"] == patient_ref
-        and (status_filter == "all" or appt["status"] == status_filter)
-    ]
+    db = get_db()
+    query = db.table("appointments").select("*").eq("patient_ref", patient_ref)
+    if status_filter != "all":
+        query = query.eq("status", status_filter)
 
-    result.sort(key=lambda a: a["slot_start"])
+    result = query.order("slot_start", desc=False).execute()
+    data = [_appointment_out(appt) for appt in result.data]
 
-    return jsonify({"patient_ref": patient_ref, "total": len(result), "data": result})
+    return jsonify({"patient_ref": patient_ref, "total": len(data), "data": data})
 
 
 # ---------------------------------------------------------------------------

@@ -1,21 +1,4 @@
 import pytest
-from app import app, APPOINTMENTS, DOCTORS
-
-
-@pytest.fixture(autouse=True)
-def reset_appointments():
-    """Restore APPOINTMENTS to seed state before each test."""
-    original = {k: dict(v) for k, v in APPOINTMENTS.items()}
-    yield
-    APPOINTMENTS.clear()
-    APPOINTMENTS.update(original)
-
-
-@pytest.fixture
-def client():
-    app.config["TESTING"] = True
-    with app.test_client() as c:
-        yield c
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +21,7 @@ def test_list_doctors_returns_all(client):
     res = client.get("/doctors")
     assert res.status_code == 200
     data = res.get_json()
-    assert len(data["data"]) == len(DOCTORS)
+    assert len(data["data"]) == 5
 
 
 def test_list_doctors_filter_by_area(client):
