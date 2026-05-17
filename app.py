@@ -1,12 +1,110 @@
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from flask import Flask, jsonify, request
+from flask import Flask, Response, g, jsonify, request
 from dotenv import load_dotenv
 from db import get_db
+
+import channel as secure_channel
 
 load_dotenv()
 
 app = Flask(__name__)
+secure_channel.init_from_env()
+
+
+# ---------------------------------------------------------------------------
+# Secure-channel hooks
+# ---------------------------------------------------------------------------
+# Backend callers (chat-orch, conversation-chat) wrap their JSON bodies in
+# an AES-256-GCM envelope and tag the request with `X-Secure-Channel:
+# aes256gcm/1`. We decrypt the body before the route handler runs so handlers
+# can keep using `request.get_json()` unchanged, and we re-encrypt the
+# response on the way out so the wire stays opaque end to end.
+#
+# Plaintext callers (the /health endpoint, anyone without the header) are
+# passed through unchanged.
+
+
+@app.before_request
+def _secure_channel_decrypt() -> Response | None:
+    if request.path == "/health":
+        return None
+    ct = (request.headers.get("Content-Type") or "").lower()
+    has_header = request.headers.get(secure_channel.HEADER_NAME) is not None
+    body_is_envelope = ct.startswith(secure_channel.CONTENT_TYPE)
+    if not has_header and not body_is_envelope:
+        g.secure_inbound = False
+        return None
+    # If the caller signalled the channel via the header but didn't send an
+    # envelope body (typical for GETs and other bodyless verbs), there's
+    # nothing to decrypt — just mark the request so the response gets sealed.
+    raw = request.get_data()
+    if not body_is_envelope or len(raw) == 0:
+        g.secure_inbound = True
+        return None
+    try:
+        envelope = json.loads(raw.decode("utf-8"))
+        plain = secure_channel.open_envelope(envelope)
+    except (json.JSONDecodeError, secure_channel.ChannelError) as e:
+        return jsonify({"error": "secure_channel_decrypt_failed", "detail": str(e)}), 400
+    # Stash the plaintext directly into Flask's body cache so handlers can
+    # call `request.get_data()` / `request.get_json()` unchanged. We bypass
+    # Werkzeug's stream wrapping (which would otherwise re-read the original
+    # ciphertext from wsgi.input) by populating the caches.
+    try:
+        parsed = json.loads(plain.decode("utf-8")) if plain else None
+    except json.JSONDecodeError:
+        parsed = None
+    request._cached_data = plain  # type: ignore[attr-defined]
+    # Flask's _cached_json is a 2-tuple keyed by `silent` (False, True). Both
+    # entries hold the parsed value; on silent=True a parse failure becomes
+    # None instead of raising.
+    request._cached_json = (parsed, parsed)  # type: ignore[attr-defined]
+    g.secure_inbound = True
+    return None
+
+
+@app.after_request
+def _secure_channel_encrypt(response: Response) -> Response:
+    if not getattr(g, "secure_inbound", False):
+        return response
+    if response.direct_passthrough:
+        # Streamed responses skip the envelope — none of Hospital-MP's
+        # endpoints stream today, but this keeps the hook safe if one is
+        # added later.
+        return response
+    body = response.get_data()
+    sealed_body, ct, _ = secure_channel.seal_json(json.loads(body) if body else {})
+    response.set_data(sealed_body)
+    response.mimetype = secure_channel.CONTENT_TYPE
+    response.headers["Content-Type"] = ct
+    response.headers[secure_channel.HEADER_NAME] = secure_channel.HEADER_VALUE
+    return response
+
+
+# Small wrapper so the WSGI environ can hold the decrypted body as a stream.
+class _BytesIO:
+    def __init__(self, data: bytes) -> None:
+        self._buf = data
+        self._pos = 0
+
+    def read(self, n: int = -1) -> bytes:
+        if n is None or n < 0:
+            chunk = self._buf[self._pos :]
+            self._pos = len(self._buf)
+            return chunk
+        chunk = self._buf[self._pos : self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def readline(self, n: int = -1) -> bytes:  # noqa: ARG002 — flask sniffs presence
+        nl = self._buf.find(b"\n", self._pos)
+        if nl == -1:
+            return self.read()
+        chunk = self._buf[self._pos : nl + 1]
+        self._pos = nl + 1
+        return chunk
 
 # ---------------------------------------------------------------------------
 # Helpers
