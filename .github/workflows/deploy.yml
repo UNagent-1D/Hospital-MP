@@ -1,0 +1,78 @@
+name: Deploy
+
+# Per-repo deploy for Hospital-MP.
+# Railway service name: hospital-mock (NOT Hospital-MP).
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Target environment (manual override)"
+        required: true
+        type: choice
+        default: dev
+        options: [dev, prod]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-dev:
+    name: Railway / dev
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
+      (github.event_name == 'workflow_dispatch' && inputs.env == 'dev')
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_DEV }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy hospital-mock to dev
+        run: railway up --service hospital-mock --environment dev --detach
+
+      - name: Smoke /health
+        if: vars.RAILWAY_DEV_HOSPITAL_URL != ''
+        run: |
+          curl --fail --retry 30 --retry-delay 10 --retry-all-errors -sS \
+               -o /dev/null -w "%{http_code}\n" \
+               "${{ vars.RAILWAY_DEV_HOSPITAL_URL }}/health"
+
+  deploy-prod:
+    name: Railway / prod
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.env == 'prod')
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_PROD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy hospital-mock to prod
+        run: railway up --service hospital-mock --environment Production --detach
+
+      - name: Smoke /health
+        if: vars.RAILWAY_PROD_HOSPITAL_URL != ''
+        run: |
+          curl --fail --retry 30 --retry-delay 10 --retry-all-errors -sS \
+               -o /dev/null -w "%{http_code}\n" \
+               "${{ vars.RAILWAY_PROD_HOSPITAL_URL }}/health"
