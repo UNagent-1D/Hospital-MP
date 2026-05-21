@@ -294,6 +294,94 @@ def cancel_appointment(appt_id: str):
     return jsonify({"id": appt_id, "status": "cancelled", "cancelled_at": now, "reason": reason})
 
 
+# 4.4b POST /appointments/<appt_id>/reschedule
+#
+# Atomic-ish: cancel the existing appointment AND book a new one at the
+# new slot with the same doctor + patient. We pre-check the new slot for
+# conflicts BEFORE cancelling so the original survives if the new slot
+# is taken. Optional `new_doctor_id` lets the patient switch doctors at
+# the same time.
+@app.post("/appointments/<appt_id>/reschedule")
+def reschedule_appointment(appt_id: str):
+    body = request.get_json(silent=True) or {}
+    new_slot_raw = body.get("new_slot_start")
+    if not new_slot_raw:
+        return jsonify({"error": "new_slot_start is required (ISO 8601)"}), 400
+    try:
+        new_slot_dt = datetime.fromisoformat(new_slot_raw)
+    except ValueError:
+        return jsonify({"error": "new_slot_start must be ISO 8601 e.g. 2026-03-15T09:00:00"}), 400
+
+    db = get_db()
+    appt_res = db.table("appointments").select("*").eq("id", appt_id).execute()
+    if not appt_res.data:
+        return jsonify({"error": "appointment not found"}), 404
+    appt = appt_res.data[0]
+    if appt["status"] == "cancelled":
+        return jsonify({"error": "appointment is already cancelled"}), 409
+
+    new_doctor_id = body.get("new_doctor_id") or appt["doctor_id"]
+    if new_doctor_id != appt["doctor_id"]:
+        doc_res = db.table("doctors").select("*").eq("id", new_doctor_id).execute()
+        if not doc_res.data:
+            return jsonify({"error": "new doctor not found"}), 404
+        new_doctor = doc_res.data[0]
+    else:
+        new_doctor = {
+            "id": appt["doctor_id"],
+            "name": appt["doctor_name"],
+            "area": appt["specialty"],
+        }
+
+    new_slot_iso = new_slot_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    new_slot_end_iso = (new_slot_dt + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Conflict check BEFORE cancelling so we don't lose the original.
+    conflict = (
+        db.table("appointments")
+        .select("id")
+        .eq("doctor_id", new_doctor_id)
+        .eq("slot_start", new_slot_iso)
+        .eq("status", "confirmed")
+        .execute()
+    )
+    # The existing appt itself doesn't count as a conflict.
+    conflicts = [row for row in conflict.data if row["id"] != appt_id]
+    if conflicts:
+        return jsonify({"error": f"slot {new_slot_iso} is already booked for doctor {new_doctor_id}"}), 409
+
+    now = datetime.now(timezone.utc).isoformat()
+    reason = body.get("reason") or "rescheduled"
+
+    # Cancel old.
+    db.table("appointments").update(
+        {"status": "cancelled", "cancelled_at": now, "cancel_reason": reason}
+    ).eq("id", appt_id).execute()
+
+    # Book new.
+    new_appt_id = f"appt-{uuid.uuid4().hex[:8]}"
+    new_appt = {
+        "id": new_appt_id,
+        "doctor_id": new_doctor_id,
+        "doctor_name": new_doctor["name"],
+        "patient_ref": appt["patient_ref"],
+        "patient_name": appt["patient_name"],
+        "specialty": new_doctor.get("area") or appt["specialty"],
+        "slot_start": new_slot_iso,
+        "slot_end": new_slot_end_iso,
+        "status": "confirmed",
+        "created_at": now,
+        "cancelled_at": None,
+        "cancel_reason": None,
+    }
+    db.table("appointments").insert(new_appt).execute()
+
+    return jsonify({
+        "rescheduled_from": appt_id,
+        "new_appointment": _appointment_out(new_appt),
+    }), 201
+
+
 # 4.5 GET /patients/<patient_ref>/appointments
 @app.get("/patients/<patient_ref>/appointments")
 def get_patient_appointments(patient_ref: str):
